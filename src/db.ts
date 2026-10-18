@@ -3,11 +3,19 @@ import { statSync, unlinkSync } from 'node:fs';
 import * as sqliteVec from 'sqlite-vec';
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
 import { config } from './config.js';
+import type { FilterPredicate } from './filter-predicate.js';
 import { getIgnoreSignature, isIgnored } from './ignore.js';
+import { extractProperties, parseFrontmatterYaml } from './property-values.js';
 
 type DB = InstanceType<typeof Database>;
 
 let _db: DB | null = null;
+
+/** Set when the typed property index could not be built or migrated. Structured
+ *  filters are refused while it is set, so they never run against partial data. */
+let _propertyIndexError: string | null = null;
+/** db_version at the last stale-row check, see ensurePropertyIndexFresh(). */
+let _propertySyncedDbVersion: number | null = null;
 
 const CORRUPTION_CODES = new Set(['SQLITE_CORRUPT', 'SQLITE_CORRUPT_VTAB', 'SQLITE_NOTADB']);
 const NON_CORRUPTION_CODES = new Set(['SQLITE_BUSY', 'SQLITE_LOCKED']);
@@ -219,6 +227,238 @@ function rebuildFrontmatterLookup(db: DB): void {
       console.error('Error parsing frontmatter for note', note.id, e);
     }
   }
+}
+
+// ─── Typed property index (structured metadata filters) ─────────────────────
+//
+// note_property_keys   one row per top-level YAML key: presence + shape. This is what
+//                      lets EXISTS / MISSING tell `key:` (null), `key: ""` and
+//                      `key: []` apart from an absent key.
+// note_property_values one row per primitive value (scalar or array element), with
+//                      its type, so the number 1 and the string "1" never collide.
+// note_property_sync   the notes.hash the rows above were built from. A mismatch
+//                      means another writer (e.g. an older engine sharing this file)
+//                      changed the note, and its rows are rebuilt from the stored
+//                      frontmatter column.
+
+const PROPERTY_LOOKUP_VERSION = '1';
+
+function createPropertyTables(db: DB): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS note_property_keys (
+      note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+      field   TEXT NOT NULL,
+      shape   TEXT NOT NULL,
+      PRIMARY KEY (note_id, field)
+    );
+    CREATE INDEX IF NOT EXISTS idx_property_keys_field ON note_property_keys(field);
+
+    CREATE TABLE IF NOT EXISTS note_property_values (
+      note_id    INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+      field      TEXT NOT NULL,
+      value_type TEXT NOT NULL,
+      value_text TEXT NOT NULL,
+      PRIMARY KEY (note_id, field, value_type, value_text)
+    );
+    CREATE INDEX IF NOT EXISTS idx_property_values_lookup
+      ON note_property_values(field, value_type, value_text);
+
+    CREATE TABLE IF NOT EXISTS note_property_sync (
+      note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+      hash    TEXT
+    );
+  `);
+}
+
+function replaceNoteProperties(
+  db: DB,
+  noteId: number,
+  data: Record<string, unknown> | null | undefined,
+  hash: string | null,
+  legacyDates: boolean,
+): void {
+  db.prepare('DELETE FROM note_property_keys WHERE note_id = ?').run(noteId);
+  db.prepare('DELETE FROM note_property_values WHERE note_id = ?').run(noteId);
+  const { keys, values } = extractProperties(data, legacyDates);
+  const insertKey = db.prepare(
+    'INSERT OR IGNORE INTO note_property_keys (note_id, field, shape) VALUES (?, ?, ?)',
+  );
+  for (const key of keys) insertKey.run(noteId, key.field, key.shape);
+  const insertValue = db.prepare(
+    'INSERT OR IGNORE INTO note_property_values (note_id, field, value_type, value_text) VALUES (?, ?, ?, ?)',
+  );
+  for (const value of values) insertValue.run(noteId, value.field, value.type, value.text);
+  db.prepare('INSERT OR REPLACE INTO note_property_sync (note_id, hash) VALUES (?, ?)').run(
+    noteId,
+    hash,
+  );
+}
+
+/** Parse the stored (re-serialised) frontmatter column. Unparsable text yields no
+ *  properties rather than an exception — one broken note must not block the index. */
+function parseStoredFrontmatter(stored: string | null | undefined): Record<string, unknown> | null {
+  if (!stored) return null;
+  try {
+    return parseFrontmatterYaml(stored);
+  } catch {
+    return null;
+  }
+}
+
+function rebuildPropertiesForRows(
+  db: DB,
+  rows: Array<{ id: number; frontmatter: string | null; hash: string | null }>,
+): void {
+  for (const row of rows) {
+    replaceNoteProperties(db, row.id, parseStoredFrontmatter(row.frontmatter), row.hash, true);
+  }
+}
+
+/**
+ * Versioned migration to the typed property index. Runs in ONE transaction: an
+ * interrupted or failed run leaves neither partial rows nor the version marker, so the
+ * next open simply retries. Notes, chunks and embeddings are never touched.
+ *
+ * A failure does not prevent the database from opening (plain search must keep
+ * working); it disables structured filters with a readable error instead.
+ */
+function migratePropertyIndex(db: DB): void {
+  _propertyIndexError = null;
+  const version = (
+    db.prepare("SELECT value FROM settings WHERE key = 'property_lookup_version'").get() as
+      { value: string } | undefined
+  )?.value;
+  if (version === PROPERTY_LOOKUP_VERSION) {
+    try {
+      createPropertyTables(db);
+    } catch (err) {
+      _propertyIndexError = `Metadata index unavailable: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    return;
+  }
+  try {
+    const migrate = db.transaction(() => {
+      createPropertyTables(db);
+      db.exec(
+        'DELETE FROM note_property_keys; DELETE FROM note_property_values; DELETE FROM note_property_sync;',
+      );
+      const rows = db.prepare('SELECT id, frontmatter, hash FROM notes').all() as Array<{
+        id: number;
+        frontmatter: string | null;
+        hash: string | null;
+      }>;
+      rebuildPropertiesForRows(db, rows);
+      db.prepare(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES('property_lookup_version', ?)",
+      ).run(PROPERTY_LOOKUP_VERSION);
+    });
+    migrate.immediate();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    _propertyIndexError = `Metadata index migration failed (index left unchanged; it is retried on the next start): ${message}`;
+    process.stderr.write(`[db] ${_propertyIndexError}\n`);
+  }
+}
+
+/** Null when structured filters can run, otherwise the reason they cannot. */
+export function getPropertyIndexError(): string | null {
+  return _propertyIndexError;
+}
+
+/**
+ * Rebuild typed property rows for notes changed by a writer that does not maintain
+ * them (an older engine sharing the database). Cheap when nothing changed: it runs
+ * only after db_version moved, and the stale check is one indexed join.
+ */
+export function ensurePropertyIndexFresh(): void {
+  if (_propertyIndexError !== null) return;
+  const db = getDb();
+  const dbVersion = getDbVersion();
+  if (_propertySyncedDbVersion === dbVersion) return;
+  try {
+    const stale = db
+      .prepare(
+        `SELECT n.id, n.frontmatter, n.hash
+         FROM notes n LEFT JOIN note_property_sync s ON s.note_id = n.id
+         WHERE s.note_id IS NULL OR s.hash IS NOT n.hash`,
+      )
+      .all() as Array<{ id: number; frontmatter: string | null; hash: string | null }>;
+    if (stale.length > 0) {
+      db.transaction(() => rebuildPropertiesForRows(db, stale)).immediate();
+    }
+    _propertySyncedDbVersion = dbVersion;
+  } catch (err) {
+    // Read-only or busy databases end up here; the next search retries.
+    process.stderr.write(
+      `[db] metadata index refresh failed: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+}
+
+const NOTE_SUMMARY_COLUMNS = 'n.path, n.title, n.tags, n.aliases';
+
+export interface NoteSummaryRow {
+  path: string;
+  title: string;
+  tags: string;
+  aliases: string | null;
+}
+
+function predicateWhere(predicate: FilterPredicate): {
+  where: string;
+  params: Array<string | number>;
+} {
+  return predicate.isEmpty
+    ? { where: '1', params: [] }
+    : { where: predicate.sql, params: predicate.params };
+}
+
+/**
+ * One page of notes matching a filter predicate, in a stable order (title, then path —
+ * path is unique, so the order is total and pages never overlap or skip).
+ * Pass `limit = null` for every match.
+ */
+export function queryNotesByPredicate(
+  predicate: FilterPredicate,
+  limit: number | null,
+  offset = 0,
+): NoteSummaryRow[] {
+  const db = getDb();
+  const { where, params } = predicateWhere(predicate);
+  const paging = limit === null ? (offset > 0 ? ' LIMIT -1 OFFSET ?' : '') : ' LIMIT ? OFFSET ?';
+  const pagingParams = limit === null ? (offset > 0 ? [offset] : []) : [limit, offset];
+  return db
+    .prepare(
+      `SELECT ${NOTE_SUMMARY_COLUMNS} FROM notes n WHERE ${where} ORDER BY n.title ASC, n.path ASC${paging}`,
+    )
+    .all(...params, ...pagingParams) as NoteSummaryRow[];
+}
+
+/** Number of NOTES (not chunks) matching a filter predicate. */
+export function countNotesByPredicate(predicate: FilterPredicate): number {
+  const db = getDb();
+  const { where, params } = predicateWhere(predicate);
+  return (
+    db.prepare(`SELECT COUNT(*) AS c FROM notes n WHERE ${where}`).get(...params) as { c: number }
+  ).c;
+}
+
+/** Subset of `paths` matching a filter predicate (batched for large inputs). */
+export function filterNotePathsByPredicate(
+  paths: string[],
+  predicate: FilterPredicate,
+): Set<string> {
+  if (predicate.isEmpty) return new Set(paths);
+  const db = getDb();
+  const matched = new Set<string>();
+  for (const batch of batchPaths(paths)) {
+    const placeholders = batch.map(() => '?').join(', ');
+    const rows = db
+      .prepare(`SELECT n.path FROM notes n WHERE n.path IN (${placeholders}) AND ${predicate.sql}`)
+      .all(...batch, ...predicate.params) as Array<{ path: string }>;
+    for (const row of rows) matched.add(row.path);
+  }
+  return matched;
 }
 
 function runMigrations(db: DB): void {
@@ -451,6 +691,8 @@ function runMigrations(db: DB): void {
       INSERT OR REPLACE INTO settings(key, value) VALUES('fts_schema_version', '3');
     `);
   }
+
+  migratePropertyIndex(db);
 }
 
 function logEvent(action: 'added' | 'updated' | 'deleted', notePath: string): void {
@@ -531,6 +773,7 @@ function openDbOnce(): DB {
     cleanupNfcPaths(db);
     restoreIgnorePatterns(db);
     _db = db;
+    _propertySyncedDbVersion = null;
     return db;
   } catch (err) {
     db.close();
@@ -716,6 +959,9 @@ export function upsertNote(
     aliases?: string[];
     content: string;
     frontmatter?: Record<string, unknown>;
+    /** Typed frontmatter for the structured-filter index, parsed from the raw YAML
+     *  text (see parseFrontmatterYaml). Defaults to `frontmatter`. */
+    properties?: Record<string, unknown> | null;
     mtime: number;
     hash: string;
     chunks: {
@@ -800,6 +1046,15 @@ export function upsertNote(
       replaceNoteAliases(db, noteId, aliases);
       replaceNoteTags(db, noteId, note.tags);
       replaceNoteFrontmatterFields(db, noteId, note.frontmatter);
+      if (_propertyIndexError === null) {
+        replaceNoteProperties(
+          db,
+          noteId,
+          note.properties !== undefined ? note.properties : note.frontmatter,
+          note.hash,
+          false,
+        );
+      }
       insertChunks(db, noteId, note.chunks);
       logEvent('updated', note.path);
       bumpDbVersion();
@@ -826,6 +1081,15 @@ export function upsertNote(
       replaceNoteAliases(db, noteId, aliases);
       replaceNoteTags(db, noteId, note.tags);
       replaceNoteFrontmatterFields(db, noteId, note.frontmatter);
+      if (_propertyIndexError === null) {
+        replaceNoteProperties(
+          db,
+          noteId,
+          note.properties !== undefined ? note.properties : note.frontmatter,
+          note.hash,
+          false,
+        );
+      }
       insertChunks(db, noteId, note.chunks);
       logEvent('added', note.path);
       bumpDbVersion();
@@ -886,6 +1150,11 @@ function deleteChildRows(db: DB, noteId: number): void {
   db.prepare('DELETE FROM note_aliases WHERE note_id = ?').run(noteId);
   db.prepare('DELETE FROM note_tags WHERE note_id = ?').run(noteId);
   db.prepare('DELETE FROM note_frontmatter_fields WHERE note_id = ?').run(noteId);
+  if (_propertyIndexError === null) {
+    db.prepare('DELETE FROM note_property_keys WHERE note_id = ?').run(noteId);
+    db.prepare('DELETE FROM note_property_values WHERE note_id = ?').run(noteId);
+    db.prepare('DELETE FROM note_property_sync WHERE note_id = ?').run(noteId);
+  }
 }
 
 export function deleteNote(notePath: string, keepLinks = false): void {

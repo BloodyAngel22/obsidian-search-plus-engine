@@ -23,6 +23,9 @@ export const SearchOptionsBoundarySchema = z.object({
   rerank: z.boolean().optional(),
   queries: z.array(z.string()).optional(),
   anchors: z.boolean().optional(),
+  // Validated in depth by parseStructuredFilters (structured-filters.ts).
+  filters: z.unknown().optional(),
+  offset: NonNegativeIntegerSchema.optional(),
 });
 
 export const SearchToolArgumentsSchema = z.object({
@@ -42,6 +45,8 @@ export const SearchToolArgumentsSchema = z.object({
   snippet_length: NonNegativeIntegerSchema.optional(),
   rerank: z.boolean().optional(),
   anchors: z.boolean().optional(),
+  filters: z.unknown().optional(),
+  offset: NonNegativeIntegerSchema.optional(),
 });
 
 export const ReadToolArgumentsSchema = z.object({
@@ -62,6 +67,11 @@ export const StatusToolArgumentsSchema = z.object({
 export const StdioStatusRequestSchema = z.object({
   id: z.string().optional(),
   action: z.literal('status'),
+});
+
+export const StdioCapabilitiesRequestSchema = z.object({
+  id: z.string().optional(),
+  action: z.literal('capabilities'),
 });
 
 export const StdioRequestSchema = z.object({

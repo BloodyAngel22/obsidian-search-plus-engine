@@ -12,6 +12,7 @@ import {
   StatusToolArgumentsSchema,
   type StringArrayParam,
 } from './boundary-validation.js';
+import { getEngineCapabilities } from './capabilities.js';
 import { config } from './config.js';
 import {
   applyDbConfigDefaults,
@@ -42,7 +43,12 @@ import {
   startWatcher,
   withIndexingDbLock,
 } from './indexer.js';
-import { isAmbiguousNotePathError, readNotes, search } from './searcher.js';
+import { isAmbiguousNotePathError, readNotes, searchWithMeta } from './searcher.js';
+import {
+  parseStructuredFilters,
+  StructuredFiltersError,
+  type StructuredFilters,
+} from './structured-filters.js';
 import { validateVaultPath } from './vault-config.js';
 
 const _dir = dirname(fileURLToPath(import.meta.url));
@@ -256,11 +262,14 @@ async function callSearchTool(a: Record<string, unknown>): Promise<McpToolResult
   let scope: StringArrayParam;
   let tag: StringArrayParam;
   let frontmatter: StringArrayParam;
+  let filters: StructuredFilters | undefined;
   try {
     scope = parseStringArrayParam('scope', searchArgs.scope);
     tag = parseStringArrayParam('tag', searchArgs.tag);
     frontmatter = parseStringArrayParam('frontmatter', searchArgs.frontmatter);
+    filters = parseStructuredFilters(searchArgs.filters);
   } catch (err) {
+    if (err instanceof StructuredFiltersError) return validationErrorResult(err.message);
     return validationErrorResult(
       `Invalid search arguments: ${err instanceof Error ? err.message : String(err)}`,
     );
@@ -272,9 +281,9 @@ async function callSearchTool(a: Record<string, unknown>): Promise<McpToolResult
   // Combine query + queries into a unified list; filter empty strings
   const allQueries = [singleQuery, ...extraQueries].filter(Boolean);
   const inputStr = notePath ?? allQueries[0] ?? '';
-  let results;
+  let response;
   try {
-    results = await search(inputStr, {
+    response = await searchWithMeta(inputStr, {
       mode: searchArgs.mode,
       scope,
       limit: searchArgs.limit,
@@ -290,14 +299,18 @@ async function callSearchTool(a: Record<string, unknown>): Promise<McpToolResult
       anchors: searchArgs.anchors,
       notePath,
       queries: allQueries.length > 1 ? allQueries : undefined,
+      filters,
+      offset: searchArgs.offset,
     });
   } catch (err) {
     if (isAmbiguousNotePathError(err)) {
       return textResult(JSON.stringify({ type: 'ambiguous', candidates: err.candidates }, null, 2));
     }
+    // Never answer a filtered request with unfiltered results: report the failure.
+    if (err instanceof StructuredFiltersError) return validationErrorResult(err.message);
     throw err;
   }
-  return textResult(JSON.stringify({ results }, null, 2));
+  return textResult(JSON.stringify({ results: response.results, meta: response.meta }, null, 2));
 }
 
 async function callReindexTool(
@@ -349,6 +362,8 @@ function callStatusTool(a: Record<string, unknown>, runtime: McpRuntime): McpToo
     ignore_patterns: config.ignorePatterns,
     respect_gitignore: config.respectGitignore,
     include_patterns: config.includePatterns,
+    api_version: getEngineCapabilities().apiVersion,
+    capabilities: getEngineCapabilities(),
   };
   if (statusArgs.include_activity) {
     output.recent_activity = stats.recentActivity;
@@ -511,6 +526,47 @@ export function createMcpServer(runtime: McpRuntime): Server {
               description:
                 'Enable cross-encoder reranking after hybrid retrieval for better ordering when result precision matters. Adds latency and downloads/caches a ~570MB model on first use. ' +
                 'Only applies to hybrid mode; do not use for exact title, alias, or keyword lookups. Default: false.',
+            },
+            filters: {
+              type: 'object',
+              description:
+                'Structured metadata filter over top-level YAML frontmatter properties, with exact typed matching. ' +
+                'Use it when the user names concrete property values ("projects alpha or beta", "type is learn", "notes without a status"). ' +
+                'Prefer it over `frontmatter` when values may be numbers/booleans, when you need OR within one property, or when you need EXISTS/MISSING. ' +
+                'Do NOT use it for topics or free text — use query for that. ' +
+                'Shape: {"conditions":[{"field":"projects","operator":"IN","values":["alpha","beta"]},{"field":"type","operator":"EQ","value":"learn"},{"field":"archived","operator":"MISSING"}]}. ' +
+                'Operators: EQ (value), IN / NOT_IN (values, ORed), EXISTS, MISSING. Conditions are ANDed, and ANDed with tag/scope/frontmatter. ' +
+                'Field names are exact and case-sensitive; values are typed (1 ≠ "1"); arrays match when they contain a value; NOT_IN also matches notes without the property. ' +
+                'With an empty query this lists matching notes (sorted by title) and meta.total gives the exact count.',
+              properties: {
+                conditions: {
+                  type: 'array',
+                  maxItems: 32,
+                  items: {
+                    type: 'object',
+                    properties: {
+                      field: { type: 'string' },
+                      operator: {
+                        type: 'string',
+                        enum: ['EQ', 'IN', 'NOT_IN', 'EXISTS', 'MISSING'],
+                      },
+                      value: { type: ['string', 'number', 'boolean', 'null'] },
+                      values: {
+                        type: 'array',
+                        maxItems: 256,
+                        items: { type: ['string', 'number', 'boolean', 'null'] },
+                      },
+                    },
+                    required: ['field', 'operator'],
+                  },
+                },
+              },
+              required: ['conditions'],
+            },
+            offset: {
+              type: 'number',
+              description:
+                'Skip this many results. Only for metadata-only listing (no query, with filters); use with limit and meta.nextOffset to page. Rejected for ranked text searches.',
             },
             anchors: {
               type: 'boolean',

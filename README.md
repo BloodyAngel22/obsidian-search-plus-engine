@@ -311,6 +311,44 @@ ohs read notes/pkm/zettelkasten.md --snippet-length 2000
 ohs read notes/pkm/zettelkasten.md --json
 ```
 
+### Structured metadata filters
+
+`--filters-json` (CLI), `filters` (MCP `search` tool and stdio `options`) take typed conditions over top-level YAML properties. They use one parser and one SQL predicate on every transport, and they are applied inside every retrieval arm (BM25, vector KNN, fuzzy title, similar notes, related) before any limit, so a narrow filter never loses matches to a global top-N.
+
+```bash
+# Notes in project alpha OR beta that are of type "learn", ranked for the query
+ohs "how does redis stream work" --filters-json '{"conditions":[
+  {"field":"projects","operator":"IN","values":["alpha","beta"]},
+  {"field":"type","operator":"EQ","value":"learn"}]}'
+
+# Metadata-only listing: exact total, stable order (title, then path), pages via --offset
+ohs --filters-json '{"conditions":[{"field":"status","operator":"MISSING"}]}' \
+  --limit 50 --offset 50 --json --with-meta
+
+# Engine API version and supported features
+ohs capabilities
+```
+
+| Operator  | Matches                                                                         |
+| --------- | ------------------------------------------------------------------------------- |
+| `EQ`      | scalar equal to `value`, or an array containing it                              |
+| `IN`      | scalar equal to any of `values`, or an array containing any of them (OR inside) |
+| `NOT_IN`  | notes whose property contains none of `values`, including notes without it      |
+| `EXISTS`  | the key is present, even when it is `null`, `""` or `[]`                        |
+| `MISSING` | the key is absent                                                               |
+
+- Conditions are ANDed with each other and with `--tag`, `--scope` and `--frontmatter`; conflicting conditions return no notes.
+- Field names are exact and case-sensitive (`Status` and `status` are different properties). Names and string values are compared in Unicode NFC.
+- Values are typed: the number `1`, the string `"1"`, `true` and `null` never match each other. Array elements are matched exactly, never as substrings.
+- Nested objects and arrays of objects are only visible to `EXISTS`/`MISSING` in this version.
+- Limits: 32 conditions, 256 values per condition, 64 KiB per filter document.
+- `offset` is only accepted for metadata-only searches (no query). Ranked searches report `meta.total: null`, because the number of notes a ranked query "matches" is not computed.
+- Search responses carry `meta` (`kind`, `returned`, `offset`, `limit`, `total`, `totalExact`, `hasMore`, `nextOffset`): stdio adds it next to `results`, MCP returns `{results, meta}`, the CLI prints it with `--json --with-meta`.
+
+The typed index (`note_property_keys`, `note_property_values`) is built by a versioned migration from the stored frontmatter the first time a new engine opens an existing database. It runs in one transaction, keeps notes, chunks and embeddings untouched, and is retried on the next start if it fails; until then structured filters return an error instead of unfiltered results and `ohs capabilities` reports `propertyIndexError`. Unquoted dates indexed before the migration come back as `YYYY-MM-DD`; other timestamps keep their ISO form until the note is re-indexed.
+
+Clients must check `capabilities` (stdio `{"action":"capabilities"}`, the `status` payload, or `ohs capabilities`) for `structuredFiltersV1` before sending `filters`: older engines silently ignore unknown options.
+
 ### Shell aliases
 
 Add to your `~/.zshrc` or `~/.bashrc` for quick access:

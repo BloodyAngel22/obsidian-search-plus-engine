@@ -34,6 +34,7 @@ import {
 } from './embedder.js';
 import { createIgnorePolicy, createIgnorePolicyForFiles, type IgnorePolicy } from './ignore.js';
 import { extractMarkdownReferences, resolveMarkdownNoteLinks } from './markdown-references.js';
+import { parseFrontmatterYaml } from './property-values.js';
 import { bumpIndexVersion } from './searcher.js';
 
 export interface IndexResult {
@@ -234,6 +235,7 @@ export async function indexFile(
     const inlineTags = parseInlineTags(content);
     const tags = [...new Set([...frontmatterTags, ...inlineTags])];
     const aliases = parseAliasField(frontmatter.aliases as unknown);
+    const properties = typedFrontmatter(frontmatterRaw, frontmatter);
 
     const modelName = activeModelName();
     const ctxLen = contextLength ?? (await getContextLength());
@@ -270,6 +272,7 @@ export async function indexFile(
         aliases,
         content,
         frontmatter: frontmatter,
+        properties,
         mtime: stat.mtimeMs,
         hash,
         chunks: embeddedChunks.map(({ chunk, embedding }) => ({
@@ -849,6 +852,22 @@ export function startWatcher(contextLength: number): void {
  * Matches # preceded by start-of-string or whitespace, followed by
  * a letter/underscore and then any word chars, hyphens, or slashes.
  */
+/**
+ * Typed frontmatter for the structured-filter index. The raw YAML text is re-parsed
+ * with the YAML 1.2 core schema so values match what Obsidian shows (unquoted dates
+ * stay strings). gray-matter's object is the fallback when the text does not parse.
+ */
+function typedFrontmatter(
+  frontmatterRaw: string,
+  fallback: Record<string, unknown>,
+): Record<string, unknown> {
+  try {
+    return parseFrontmatterYaml(frontmatterRaw) ?? {};
+  } catch {
+    return fallback;
+  }
+}
+
 /**
  * Parse the `aliases` field from gray-matter frontmatter.
  * Handles three formats emitted by Obsidian:

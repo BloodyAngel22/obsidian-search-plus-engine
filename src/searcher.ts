@@ -1,8 +1,12 @@
 import path from 'node:path';
+import { ENGINE_API_VERSION } from './capabilities.js';
 import { buildMatchText, buildMatchTextFromMarkedSnippet, stripSnippetMarkers } from './chunker.js';
 import { config } from './config.js';
 import {
+  countNotesByPredicate,
+  ensurePropertyIndexFresh,
   filterNotePathsByFrontmatter,
+  filterNotePathsByPredicate,
   filterNotePathsByTag,
   getBacklinksForPaths,
   getChunkEmbeddingsByPath,
@@ -13,8 +17,10 @@ import {
   getMatchingNotesByFrontmatter,
   getNoteByPath,
   getOutgoingLinksForPaths,
+  getPropertyIndexError,
   getUrlsForPaths,
   hasVecTable,
+  queryNotesByPredicate,
   resolveNotePath,
 } from './db.js';
 import { embed } from './embedder.js';
@@ -25,6 +31,12 @@ import {
 } from './markdown-references.js';
 import { reranker, type RerankCandidate } from './reranker.js';
 import { measureSearchStage, measureSearchStageSync } from './search-profile.js';
+import {
+  hasStructuredFilters,
+  StructuredFiltersError,
+  structuredFiltersKey,
+  type StructuredFilters,
+} from './structured-filters.js';
 
 export interface NoteReadResult {
   path: string;
@@ -119,6 +131,36 @@ export interface SearchOptions {
   queries?: string[];
   /** When true, populates previewAnchors on each result with chunk location data. */
   anchors?: boolean;
+  /**
+   * Structured metadata conditions (validated by parseStructuredFilters). ANDed with
+   * tag/scope/frontmatter and applied inside every retrieval arm, before any limit.
+   */
+  filters?: StructuredFilters;
+  /** Page offset. Only supported for metadata-only searches (empty query + filters). */
+  offset?: number;
+}
+
+/**
+ * Describes the result page. `total` is an exact document count and is only reported
+ * when the engine actually computed it (metadata-only searches). Ranked searches report
+ * `total: null` — the number of notes that would match a ranked query is not known.
+ */
+export interface SearchMeta {
+  apiVersion: number;
+  kind: 'ranked' | 'metadata' | 'related' | 'similar';
+  returned: number;
+  offset: number;
+  /** Page size used; null means "no limit". */
+  limit: number | null;
+  total: number | null;
+  totalExact: boolean;
+  hasMore: boolean | null;
+  nextOffset: number | null;
+}
+
+export interface SearchResponse {
+  results: SearchResult[];
+  meta: SearchMeta;
 }
 
 interface RawResult {
@@ -1279,7 +1321,7 @@ class LRUCache<V> {
   }
 }
 
-const searchCache = new LRUCache<SearchResult[]>(100);
+const searchCache = new LRUCache<SearchResponse>(100);
 
 // In-process counter for test isolation: incremented by bumpIndexVersion() so that
 // separate test suites sharing the same Node.js process don't get cross-suite cache hits.
@@ -1308,20 +1350,111 @@ function cacheKey(input: string, options: SearchOptions): string {
   const rerankStr = options.rerank ? config.rerankerModel : '';
   const queriesStr = options.queries && options.queries.length > 1 ? options.queries.join('|') : '';
   const anchorsStr = options.anchors ? 'a' : '';
+  const filtersStr = structuredFiltersKey(options.filters);
+  const offsetStr = options.offset ? String(options.offset) : '';
   // Two-component version:
   //   getDbVersion() — shared via SQLite settings; any process that modifies the DB
   //                    bumps it, invalidating caches in all other processes.
   //   localVersion   — in-process counter; bumpIndexVersion() for test-suite isolation.
-  return `v${getDbVersion()}_${localVersion}\0${input}\0${options.mode ?? ''}\0${scopeStr}\0${options.limit ?? ''}\0${options.threshold ?? ''}\0${tagStr}\0${fmStr}\0${options.snippetLength ?? ''}\0${options.notePath ?? ''}\0${rerankStr}\0${queriesStr}\0${anchorsStr}`;
+  return `v${getDbVersion()}_${localVersion}\0${input}\0${options.mode ?? ''}\0${scopeStr}\0${options.limit ?? ''}\0${options.threshold ?? ''}\0${tagStr}\0${fmStr}\0${options.snippetLength ?? ''}\0${options.notePath ?? ''}\0${rerankStr}\0${queriesStr}\0${anchorsStr}\0${filtersStr}\0${offsetStr}`;
+}
+
+function rankedMeta(
+  kind: SearchMeta['kind'],
+  results: SearchResult[],
+  limit: number | null,
+): SearchMeta {
+  return {
+    apiVersion: ENGINE_API_VERSION,
+    kind,
+    returned: results.length,
+    offset: 0,
+    limit,
+    total: null,
+    totalExact: false,
+    hasMore: null,
+    nextOffset: null,
+  };
+}
+
+function toMetadataResult(m: {
+  path: string;
+  title: string;
+  tags: string;
+  aliases: string | null;
+}): RawResult {
+  return {
+    path: m.path,
+    title: m.title ?? '',
+    tags: m.tags ?? '[]',
+    aliases: m.aliases,
+    snippet: '',
+    score: 1.0,
+    scores: { hybrid: 1.0 },
+  };
+}
+
+/**
+ * Metadata-only search: no text query, so no embedding, no ranking and no reranking.
+ * One SQL page over `notes` in a stable title/path order, plus an exact document count.
+ */
+function searchMetadataOnly(options: SearchOptions, limit: number): SearchResponse {
+  const predicate = buildFilterPredicate(options);
+  const offset = options.offset ?? 0;
+  const pageLimit = limit === 0 ? UNLIMITED_RESULTS : limit;
+  const rows = queryNotesByPredicate(predicate, pageLimit, offset);
+  const total = countNotesByPredicate(predicate);
+  const paths = rows.map((row) => row.path);
+  const { links, backlinks } = getLinksForPaths(paths);
+  const results = rows.map((row, i) => {
+    const sr = toSearchResult(toMetadataResult(row));
+    return {
+      ...sr,
+      rank: offset + i + 1,
+      links: links.get(sr.path) ?? [],
+      backlinks: backlinks.get(sr.path) ?? [],
+    };
+  });
+  const end = offset + results.length;
+  return {
+    results,
+    meta: {
+      apiVersion: ENGINE_API_VERSION,
+      kind: 'metadata',
+      returned: results.length,
+      offset,
+      limit: limit === 0 ? null : limit,
+      total,
+      totalExact: true,
+      hasMore: end < total,
+      nextOffset: end < total ? end : null,
+    },
+  };
+}
+
+function assertStructuredFiltersUsable(options: SearchOptions): void {
+  if (!hasStructuredFilters(options.filters)) return;
+  const error = getPropertyIndexError();
+  if (error !== null) throw new StructuredFiltersError(error);
+  ensurePropertyIndexFresh();
+}
+
+/** Ranked search returning only the result list (the long-standing API). */
+export async function search(input: string, options: SearchOptions = {}): Promise<SearchResult[]> {
+  return (await searchWithMeta(input, options)).results;
 }
 
 // eslint-disable-next-line sonarjs/cognitive-complexity -- primary search entry-point; complexity is inherent in the multi-mode, multi-filter pipeline
-export async function search(input: string, options: SearchOptions = {}): Promise<SearchResult[]> {
+export async function searchWithMeta(
+  input: string,
+  options: SearchOptions = {},
+): Promise<SearchResponse> {
   const mode = options.mode ?? 'hybrid';
   const limit = options.limit ?? 10;
   const threshold = options.threshold ?? 0.0;
   const noLimit = limit === 0;
   const snippetLength = options.snippetLength ?? 300;
+  assertStructuredFiltersUsable(options);
 
   // Path-based lookup when --path is given explicitly, OR when related mode is
   // requested and the input looks like a note path (allows the shorthand
@@ -1353,7 +1486,7 @@ export async function search(input: string, options: SearchOptions = {}): Promis
     const fmStr = Array.isArray(options.frontmatter)
       ? options.frontmatter.join(',')
       : (options.frontmatter ?? '');
-    const key = `related\0v${getDbVersion()}_${localVersion}\0${resolvedPath}\0${maxDepth}\0${direction}\0${linkType}\0${snippetLength}\0${scopeStr}\0${tagStr}\0${fmStr}`;
+    const key = `related\0v${getDbVersion()}_${localVersion}\0${resolvedPath}\0${maxDepth}\0${direction}\0${linkType}\0${snippetLength}\0${scopeStr}\0${tagStr}\0${fmStr}\0${structuredFiltersKey(options.filters)}`;
     const cached = searchCache.get(key);
     if (cached) return cached;
     let related = searchRelated(resolvedPath, maxDepth, direction, snippetLength, linkType);
@@ -1375,6 +1508,13 @@ export async function search(input: string, options: SearchOptions = {}): Promis
       );
       related = related.filter((result) => allowedPaths.has(result.path));
     }
+    if (hasStructuredFilters(options.filters)) {
+      const allowedPaths = filterNotePathsByPredicate(
+        related.map((result) => result.path),
+        buildFilterPredicate({ filters: options.filters }),
+      );
+      related = related.filter((result) => allowedPaths.has(result.path));
+    }
     const fallbackSnippets = getSnippetFallbacks(
       related.filter((r) => !r.snippet || r.snippet.length < snippetLength).map((r) => r.path),
       snippetLength,
@@ -1390,8 +1530,9 @@ export async function search(input: string, options: SearchOptions = {}): Promis
     related.forEach((r, i) => {
       r.rank = i + 1;
     });
-    searchCache.set(key, related);
-    return related;
+    const relatedResponse = { results: related, meta: rankedMeta('related', related, null) };
+    searchCache.set(key, relatedResponse);
+    return relatedResponse;
   }
 
   // Filter-only mode: no text query, but filters present (frontmatter, tag, scope)
@@ -1399,8 +1540,30 @@ export async function search(input: string, options: SearchOptions = {}): Promis
   const hasFrontmatterFilter = hasFilterValue(options.frontmatter);
   const hasTagFilter = hasFilterValue(options.tag);
   const hasScopeFilter = hasFilterValue(options.scope);
+  const hasStructured = hasStructuredFilters(options.filters);
+  const isMetadataOnly =
+    !input &&
+    !isPathLookup &&
+    (hasFrontmatterFilter || hasTagFilter || hasScopeFilter || hasStructured);
 
-  if (!input && !isPathLookup && (hasFrontmatterFilter || hasTagFilter || hasScopeFilter)) {
+  if ((options.offset ?? 0) > 0 && !isMetadataOnly) {
+    throw new StructuredFiltersError(
+      'Invalid search options: offset is only supported for metadata-only searches (empty query with filters)',
+    );
+  }
+
+  if (isMetadataOnly && (hasStructured || options.offset !== undefined)) {
+    const metaKey = cacheKey('', options);
+    const cachedMeta = searchCache.get(metaKey);
+    if (cachedMeta) return cachedMeta;
+    const response = measureSearchStageSync('metadataOnly', () =>
+      searchMetadataOnly(options, limit),
+    );
+    searchCache.set(metaKey, response);
+    return response;
+  }
+
+  if (isMetadataOnly) {
     const fmKey = cacheKey('', options);
     const cachedFm = searchCache.get(fmKey);
     if (cachedFm) return cachedFm;
@@ -1457,6 +1620,7 @@ export async function search(input: string, options: SearchOptions = {}): Promis
     }
 
     // Apply limit (0 = no limit)
+    const totalMatches = fmResults.length;
     if (limit > 0) {
       fmResults = fmResults.slice(0, limit);
     }
@@ -1467,9 +1631,25 @@ export async function search(input: string, options: SearchOptions = {}): Promis
       return sr;
     });
 
-    searchCache.set(fmKey, finalResults);
+    // Exact unless the FETCH_ALL ceiling truncated the candidate list.
+    const totalExact = totalMatches < FETCH_ALL;
+    const fmResponse: SearchResponse = {
+      results: finalResults,
+      meta: {
+        apiVersion: ENGINE_API_VERSION,
+        kind: 'metadata',
+        returned: finalResults.length,
+        offset: 0,
+        limit: limit > 0 ? limit : null,
+        total: totalExact ? totalMatches : null,
+        totalExact,
+        hasMore: totalExact ? finalResults.length < totalMatches : null,
+        nextOffset: totalExact && finalResults.length < totalMatches ? finalResults.length : null,
+      },
+    };
+    searchCache.set(fmKey, fmResponse);
 
-    return finalResults;
+    return fmResponse;
   }
 
   // For path lookups, include mtime in cache key so stale entries auto-invalidate
@@ -1602,8 +1782,12 @@ export async function search(input: string, options: SearchOptions = {}): Promis
     }
   }
 
-  searchCache.set(key, final);
-  return final;
+  const response: SearchResponse = {
+    results: final,
+    meta: rankedMeta(isPathLookup ? 'similar' : 'ranked', final, noLimit ? null : limit),
+  };
+  searchCache.set(key, response);
+  return response;
 }
 
 /**

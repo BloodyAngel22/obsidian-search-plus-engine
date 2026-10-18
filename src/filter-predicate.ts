@@ -1,4 +1,11 @@
 import { normalizeTag } from './db.js';
+import { canonicalScalar, normalizePropertyText } from './property-values.js';
+import {
+  hasStructuredFilters,
+  type FilterCondition,
+  type FilterScalar,
+  type StructuredFilters,
+} from './structured-filters.js';
 
 export interface FilterPredicate {
   /** SQL boolean expression over the alias `n` (the `notes` table), already
@@ -16,6 +23,8 @@ interface FilterOptions {
   tag?: string | string[];
   scope?: string | string[];
   frontmatter?: string | string[];
+  /** Validated structured metadata conditions (see structured-filters.ts). */
+  filters?: StructuredFilters;
 }
 
 /**
@@ -110,12 +119,63 @@ function scopeClause(value: string, params: Array<string | number>): string {
   return `(n.path = ? OR (n.path >= ? AND n.path < ?))`;
 }
 
+/**
+ * Typed membership test against note_property_values. Field names, types and values
+ * are ALL bound parameters — nothing from the request is interpolated into the SQL —
+ * and the operator only selects between two fixed templates (EXISTS / NOT EXISTS).
+ *
+ * The subquery alias is `pv`, never `n`: searchVector rewrites `n.` to `n2.` to reuse
+ * the predicate inside its KNN subquery, and the correlation must follow that rewrite.
+ */
+function propertyValuesClause(
+  field: string,
+  values: FilterScalar[],
+  params: Array<string | number>,
+): string {
+  const seen = new Set<string>();
+  const pairs: string[] = [];
+  params.push(normalizePropertyText(field));
+  for (const value of values) {
+    const { type, text } = canonicalScalar(value);
+    const key = `${type}\u0000${text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pairs.push('(pv.value_type = ? AND pv.value_text = ?)');
+    params.push(type, text);
+  }
+  return `EXISTS (SELECT 1 FROM note_property_values pv WHERE pv.note_id = n.id AND pv.field = ? AND (${pairs.join(' OR ')}))`;
+}
+
+function propertyKeyClause(field: string, params: Array<string | number>): string {
+  params.push(normalizePropertyText(field));
+  return `EXISTS (SELECT 1 FROM note_property_keys pk WHERE pk.note_id = n.id AND pk.field = ?)`;
+}
+
+function structuredConditionClause(
+  condition: FilterCondition,
+  params: Array<string | number>,
+): string {
+  switch (condition.operator) {
+    case 'EQ':
+      return propertyValuesClause(condition.field, [condition.value], params);
+    case 'IN':
+      return propertyValuesClause(condition.field, condition.values, params);
+    case 'NOT_IN':
+      return `NOT ${propertyValuesClause(condition.field, condition.values, params)}`;
+    case 'EXISTS':
+      return propertyKeyClause(condition.field, params);
+    case 'MISSING':
+      return `NOT ${propertyKeyClause(condition.field, params)}`;
+  }
+}
+
 export function buildFilterPredicate(options: FilterOptions): FilterPredicate {
   const empty: FilterPredicate = { sql: '', params: [], isEmpty: true };
   if (
     !hasFilterValue(options.tag) &&
     !hasFilterValue(options.scope) &&
-    !hasFilterValue(options.frontmatter)
+    !hasFilterValue(options.frontmatter) &&
+    !hasStructuredFilters(options.filters)
   ) {
     return empty;
   }
@@ -153,6 +213,15 @@ export function buildFilterPredicate(options: FilterOptions): FilterPredicate {
     clauses.push(`(${scope.includes.map((s) => scopeClause(s, params)).join(' OR ')})`);
   }
   for (const s of scope.excludes) clauses.push(`NOT ${scopeClause(s, params)}`);
+
+  // Structured conditions are ANDed with each other and with the legacy filters above,
+  // so a manual `status:done` and a visual `status IN [todo]` together match nothing
+  // instead of one silently overriding the other.
+  if (hasStructuredFilters(options.filters)) {
+    for (const condition of options.filters!.conditions) {
+      clauses.push(structuredConditionClause(condition, params));
+    }
+  }
 
   // Every supplied value was unparsable (e.g. frontmatter "-not-a-pair"), so nothing
   // constrains the query. Returning "()" here would be a SQL syntax error that the

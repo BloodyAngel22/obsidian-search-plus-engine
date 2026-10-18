@@ -1,3 +1,4 @@
+import { getEngineCapabilities } from './capabilities.js';
 import { config } from './config.js';
 import { getStats } from './db.js';
 import { activeModelName, useRemoteEmbeddings } from './embedder.js';
@@ -47,5 +48,9 @@ export function buildStatusPayload({
     ignore_patterns: config.ignorePatterns,
     respect_gitignore: config.respectGitignore,
     include_patterns: config.includePatterns,
+    // Engine API version and feature flags; clients check these before sending
+    // structured filters (see capabilities.ts).
+    api_version: getEngineCapabilities().apiVersion,
+    capabilities: getEngineCapabilities(),
   };
 }

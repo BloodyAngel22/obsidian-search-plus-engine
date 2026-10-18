@@ -51,7 +51,18 @@ import {
 import { runHttpMcpServerCli } from './mcp-http-server.js';
 import { runStdioMcpServer } from './mcp-stdio-server.js';
 import { ensureMcpServer, formatMcpInfo, getMcpStatus, stopMcpServer } from './mcp-supervisor.js';
-import { isAmbiguousNotePathError, readNotes, search } from './searcher.js';
+import { getEngineCapabilities } from './capabilities.js';
+import {
+  isAmbiguousNotePathError,
+  readNotes,
+  searchWithMeta,
+  type SearchMeta,
+} from './searcher.js';
+import {
+  parseStructuredFilters,
+  StructuredFiltersError,
+  type StructuredFilters,
+} from './structured-filters.js';
 import { buildStatusPayload } from './status-payload.js';
 import { handleStdioLine } from './stdio-server.js';
 import { enableModelDownloadProgress } from './model-download-progress.js';
@@ -82,6 +93,29 @@ const version = readPackageVersion();
 function failCliValidation(err: unknown): never {
   console.error('Error:', err instanceof Error ? err.message : String(err));
   process.exit(1);
+}
+
+function parseCliStructuredFilters(raw: string | undefined): StructuredFilters | undefined {
+  try {
+    return raw !== undefined ? parseStructuredFilters(raw) : undefined;
+  } catch (err) {
+    failCliValidation(err);
+  }
+}
+
+/** One line under the table when a metadata-only page shows only part of the matches. */
+function printPageSummary(meta: SearchMeta, shown: number): void {
+  if (!meta.totalExact || meta.total === null || meta.total <= shown) return;
+  console.log(`Showing ${meta.offset + 1}-${meta.offset + shown} of ${meta.total} matching notes.`);
+}
+
+function parseOptionalCliInteger(name: string, raw: string | undefined): number | undefined {
+  return raw !== undefined ? parseCliIntegerOption(name, raw, { min: 0 }) : undefined;
+}
+
+/** Invalid filters or offsets are usage errors: print them, never a stack trace. */
+function failStructuredFiltersError(err: unknown): void {
+  if (err instanceof StructuredFiltersError) failCliValidation(err);
 }
 
 function failAmbiguousPath(err: unknown): boolean {
@@ -171,6 +205,9 @@ interface SearchOpts {
   onlyAbsolutePaths?: boolean;
   rerank?: boolean;
   anchors?: boolean;
+  filtersJson?: string;
+  offset?: string;
+  withMeta?: boolean;
 }
 
 interface ReindexOpts {
@@ -561,12 +598,22 @@ program
     '--anchors',
     'Include previewAnchors (headingPath, matchText, charStart/charEnd) in JSON output',
   )
+  .option(
+    '--filters-json <json>',
+    'Structured metadata filters as JSON, e.g. \'{"conditions":[{"field":"type","operator":"EQ","value":"learn"}]}\'. Operators: EQ, IN, NOT_IN, EXISTS, MISSING. ANDed with other filters',
+  )
+  .option('--offset <n>', 'Result offset for metadata-only searches (empty query with filters)')
+  .option('--with-meta', 'With --json: print {results, meta} including exact total counts')
   .action(async (queries: string[], opts: SearchOpts) => {
     const effectiveInput = opts.path ?? queries[0];
     const frontmatterFilters = [...opts.frontmatter, ...opts.prop];
     const scopeFilters = [...opts.scope, ...opts.folder];
+    const structuredFilters = parseCliStructuredFilters(opts.filtersJson);
     const hasFilters =
-      frontmatterFilters.length > 0 || opts.tag.length > 0 || scopeFilters.length > 0;
+      frontmatterFilters.length > 0 ||
+      opts.tag.length > 0 ||
+      scopeFilters.length > 0 ||
+      (structuredFilters?.conditions.length ?? 0) > 0;
     if (!effectiveInput && !hasFilters) {
       program.help();
       return;
@@ -578,7 +625,9 @@ program
     let threshold: number;
     let depth: number;
     let snippetLength: number | undefined;
+    let offset: number | undefined;
     try {
+      offset = parseOptionalCliInteger('--offset', opts.offset);
       parsedLimit =
         opts.limit !== undefined
           ? parseCliIntegerOption('--limit', opts.limit, { min: 0 })
@@ -606,8 +655,9 @@ program
     await init();
 
     let results;
+    let meta;
     try {
-      results = await search(effectiveInput ?? '', {
+      ({ results, meta } = await searchWithMeta(effectiveInput ?? '', {
         mode: opts.mode,
         scope: scopeFilters.length > 0 ? scopeFilters : undefined,
         limit: parsedLimit,
@@ -623,14 +673,17 @@ program
         rerank: opts.rerank ?? false,
         anchors: opts.anchors ?? false,
         queries: !opts.path && queries.length > 1 ? queries : undefined,
-      });
+        filters: structuredFilters,
+        offset,
+      }));
     } catch (err) {
       failAmbiguousPath(err);
+      failStructuredFiltersError(err);
       throw err;
     }
 
     if (opts.json) {
-      console.log(JSON.stringify(results, null, 2));
+      console.log(JSON.stringify(opts.withMeta ? { results, meta } : results, null, 2));
       return;
     }
 
@@ -665,6 +718,7 @@ program
     }
 
     printSearchTable(results, opts.extended ?? false, isFilterOnlyMode);
+    printPageSummary(meta, results.length);
 
     if (opts.open) {
       await openInObsidian(
@@ -672,6 +726,16 @@ program
         results.map((r) => r.path),
       );
     }
+  });
+
+program
+  .command('capabilities')
+  .description('Print the engine API version and supported features as JSON')
+  .action(() => {
+    // Opening the database runs pending migrations, so the report reflects whether the
+    // metadata index is actually usable for this vault.
+    openDb();
+    console.log(JSON.stringify(getEngineCapabilities(), null, 2));
   });
 
 program
@@ -943,7 +1007,7 @@ const serveCommand = program
         // correctly regardless of arrival order.
         void handleStdioLine(
           line,
-          search,
+          searchWithMeta,
           (s) => process.stdout.write(s + '\n'),
           () => buildStatusPayload({ contextLength, version }),
         );

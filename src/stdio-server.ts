@@ -1,19 +1,28 @@
 import {
   formatValidationError,
   parseStringArrayParam,
+  StdioCapabilitiesRequestSchema,
   StdioRequestSchema,
   StdioStatusRequestSchema,
   type SearchOptionsBoundary,
 } from './boundary-validation.js';
-import type { SearchOptions, SearchResult } from './searcher.js';
+import { getEngineCapabilities } from './capabilities.js';
+import type { SearchMeta, SearchOptions, SearchResponse, SearchResult } from './searcher.js';
+import { parseStructuredFilters } from './structured-filters.js';
 
-export type SearchFunction = (query: string, options?: SearchOptions) => Promise<SearchResult[]>;
+/** Either the plain result list or a full response with page metadata. */
+export type SearchFunction = (
+  query: string,
+  options?: SearchOptions,
+) => Promise<SearchResult[] | SearchResponse>;
 export type StatusFunction = () => Promise<Record<string, unknown>> | Record<string, unknown>;
 
 export interface StdioResponse {
   id: string;
   results?: SearchResult[];
+  meta?: SearchMeta;
   status?: Record<string, unknown>;
+  capabilities?: Record<string, unknown>;
   error?: string;
 }
 
@@ -26,6 +35,11 @@ export interface StdioResponse {
  *   Response: {"id":"1","results":[...]}
  *   Request:  {"id":"2","action":"status"}
  *   Response: {"id":"2","status":{...}}
+ *   Request:  {"id":"3","action":"capabilities"}
+ *   Response: {"id":"3","capabilities":{"apiVersion":2,"capabilities":[...]}}
+ *   Search responses carry `meta` (page and count information) when the search
+ *   function provides it. Engines without the capabilities action answer it with
+ *   "unknown action", which is how clients detect them.
  *   Error:    {"id":"1","error":"message"}
  */
 export async function handleStdioLine(
@@ -47,6 +61,17 @@ export async function handleStdioLine(
     if (isRecord(raw) && Object.hasOwn(raw, 'action')) {
       if (typeof raw.action !== 'string') {
         writeLine(JSON.stringify({ id, error: 'Invalid stdio request: action must be a string' }));
+        return;
+      }
+      if (raw.action === 'capabilities') {
+        const parsed = StdioCapabilitiesRequestSchema.safeParse(raw);
+        if (!parsed.success) {
+          writeLine(
+            JSON.stringify({ id, error: formatValidationError('stdio request', parsed.error) }),
+          );
+          return;
+        }
+        writeLine(JSON.stringify({ id, capabilities: getEngineCapabilities() }));
         return;
       }
       if (raw.action !== 'search' && raw.action !== 'status') {
@@ -80,8 +105,12 @@ export async function handleStdioLine(
 
     const req = parsed.data;
     const options = normalizeSearchOptions(req.options);
-    const results = await searchFn(req.query, options);
-    writeLine(JSON.stringify({ id, results }));
+    const response = await searchFn(req.query, options);
+    if (Array.isArray(response)) {
+      writeLine(JSON.stringify({ id, results: response }));
+    } else {
+      writeLine(JSON.stringify({ id, results: response.results, meta: response.meta }));
+    }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     writeLine(JSON.stringify({ id, error }));
@@ -106,6 +135,9 @@ function normalizeSearchOptions(rawOptions: SearchOptionsBoundary | undefined): 
   if (rawOptions.rerank !== undefined) options.rerank = rawOptions.rerank;
   if (rawOptions.queries !== undefined) options.queries = rawOptions.queries;
   if (rawOptions.anchors !== undefined) options.anchors = rawOptions.anchors;
+  if (rawOptions.offset !== undefined) options.offset = rawOptions.offset;
+  const filters = parseStructuredFilters(rawOptions.filters);
+  if (filters !== undefined) options.filters = filters;
 
   const scope = parseStringArrayParam('scope', rawOptions.scope);
   if (scope !== undefined) options.scope = scope;
