@@ -96,7 +96,8 @@ query, while still exercising retrieval over a large generated memory vault.
 - **Tag filtering**
   - filter by tag(s); supports multiple values and exclusions (`-category/cs`)
 - **Snippet control**
-  - `--snippet-length` sets the context window; empty snippets always fall back to note content
+  - `--snippet-length` sets the context window; only results without a matching passage (e.g. title-only matches) fall back to the start of the note
+  - every ranked result has one primary passage: its snippet, heading path and first preview anchor come from the same chunk. In hybrid mode the exact BM25 hit is shown when the query is a technical identifier or a phrase found literally in the note (and the semantic passage does not already show it); otherwise the semantic passage is shown. This never changes the order of results. Inside that chunk the snippet then starts at the most relevant Markdown block (paragraph, list item, table, code block): the exact hit's block, or for questions the block closest to the query by embedding. `snippetSource` (`bm25`, `semantic`, `intro`) tells where the snippet came from
 - **Extended output**
   - `--extended` adds a TAGS/ALIASES column to the CLI table showing frontmatter tags (`#tag`) and aliases
 - **Incremental indexing**

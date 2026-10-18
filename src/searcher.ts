@@ -29,6 +29,24 @@ import {
   extractMarkdownReferenceOccurrences,
   resolveMarkdownNoteLinks,
 } from './markdown-references.js';
+import {
+  blockEmbeddingText,
+  candidateBlocks,
+  chooseBlock,
+  findExactOccurrence,
+  findTermOccurrence,
+  isLiteralQuery,
+  passageRange,
+  queryTerms,
+  splitMarkdownBlocks,
+  type PassageBlock,
+} from './passage-blocks.js';
+import {
+  choosePrimaryPassage,
+  type NotePassages,
+  type Passage,
+  type PassageKind,
+} from './passage-selection.js';
 import { reranker, type RerankCandidate } from './reranker.js';
 import { measureSearchStage, measureSearchStageSync } from './search-profile.js';
 import {
@@ -80,6 +98,19 @@ export interface MatchAnchor {
   matchText: string; // first ~80 stripped chars of chunk body for DOM block lookup
   charStart: number | null; // null if chunk indexed before this migration
   charEnd: number | null;
+  /**
+   * Body-relative offsets of a verified exact hit: the FTS hit for BM25 anchors, or the
+   * whole identifier/phrase inside a semantic passage (hybrid and full-text only).
+   */
+  matchStart?: number;
+  matchEnd?: number;
+  /**
+   * Body-relative bounds of the selected passage (one Markdown block, sometimes with
+   * the next block as context). The snippet starts here and `matchText` is its first
+   * line (semantic) or the hit line (BM25). Ranked text searches only.
+   */
+  passageStart?: number;
+  passageEnd?: number;
 }
 
 export interface SearchResult {
@@ -105,6 +136,12 @@ export interface SearchResult {
   };
   previewAnchors?: MatchAnchor[];
   primaryAnchorIndex?: number;
+  /**
+   * Where `snippet` came from: the selected primary passage (`bm25` / `semantic`), or
+   * the start of the note (`intro`) when the result has no retrieval passage (e.g. a
+   * title-only match). Ranked searches only.
+   */
+  snippetSource?: 'bm25' | 'semantic' | 'intro';
 }
 
 export interface SearchOptions {
@@ -180,6 +217,9 @@ interface RawResult {
   };
   semanticAnchor?: MatchAnchor;
   bm25Anchor?: MatchAnchor;
+  /** Per-branch passages; the one chosen by choosePrimaryPassage drives snippet + anchor. */
+  passages?: NotePassages;
+  primaryPassage?: PassageKind | null;
 }
 
 export function matchesScopeFilter(notePath: string, scope: string | string[]): boolean {
@@ -225,7 +265,7 @@ function toSearchResult(r: RawResult): SearchResult {
   if (r.scores.semantic != null) matchedBy.push('semantic');
   if (r.scores.bm25 != null) matchedBy.push('bm25');
   if (r.scores.fuzzy_title != null) matchedBy.push('title');
-  const { chunkText: _chunkText, ...rest } = r;
+  const { chunkText: _chunkText, passages: _passages, primaryPassage: _primary, ...rest } = r;
   return {
     ...rest,
     tags,
@@ -364,34 +404,58 @@ export function searchBm25(
         bm25: Math.max(0, Math.abs(row.rank) / (1 + Math.abs(row.rank))),
       },
     }));
-    // Enrich BM25 snippets with heading breadcrumb and/or build anchor data.
-    // Skip when neither is needed (snippetLength=0 and buildAnchors=false).
+    // Enrich BM25 snippets with heading breadcrumb and build the BM25 passage. Its
+    // chunk is the one holding the located FTS hit, so the snippet, heading path and
+    // anchor all describe the same place. Skipped when neither snippet nor anchors are
+    // needed (snippetLength=0 and buildAnchors=false).
     if (snippetLength > 0 || buildAnchors) {
-      const chunkDataMap = getChunkDataForBm25Results(results);
+      const markedSnippets = new Map(rows.map((row) => [row.path, row.snippet ?? '']));
+      const chunkDataMap = getChunkDataForBm25Results(results, markedSnippets);
       for (let i = 0; i < results.length; i++) {
         const result = results[i]!;
+        const markedSnippet = rows[i]!.snippet ?? '';
         const data = chunkDataMap.get(result.path);
-        if (data) {
-          if (snippetLength > 0 && data.headingPath) {
-            result.snippet = `${data.headingPath}\n${result.snippet}`;
-          }
-          if (buildAnchors) {
-            // Use the still-marked raw snippet (positioned near the match) for matchText,
-            // not the full chunk — the sentinel markers pin down which line is the real hit.
-            const rawSnippet = (rows[i]!.snippet ?? '').replace(/\.\.\./g, '');
-            result.bm25Anchor = {
-              kind: 'bm25',
-              headingPath: data.headingPath,
-              matchText: buildMatchTextFromMarkedSnippet(
-                rawSnippet,
-                SNIPPET_MARK_START,
-                SNIPPET_MARK_END,
-              ),
-              charStart: data.charStart,
-              charEnd: data.charEnd,
-            };
-          }
+        if (snippetLength > 0) {
+          // Keep the hit inside the final snippetLength cap: snippet() counts tokens and
+          // may start its window at the top of the note, far before the hit.
+          const prefix = data?.headingPath ? `${data.headingPath}\n` : '';
+          const window = focusSnippetOnHit(markedSnippet, snippetLength - prefix.length);
+          if (window !== null) result.snippet = window;
+          result.snippet = prefix + result.snippet;
         }
+        let anchor: MatchAnchor | undefined;
+        if (data) {
+          // Use the still-marked raw snippet (positioned near the match) for matchText,
+          // not the full chunk — the sentinel markers pin down which line is the real hit.
+          const rawSnippet = markedSnippet.replace(/\.\.\./g, '');
+          anchor = {
+            kind: 'bm25',
+            headingPath: data.headingPath,
+            matchText: buildMatchTextFromMarkedSnippet(
+              rawSnippet,
+              SNIPPET_MARK_START,
+              SNIPPET_MARK_END,
+            ),
+            charStart: data.charStart,
+            charEnd: data.charEnd,
+            ...(data.matchStart !== undefined && {
+              matchStart: data.matchStart,
+              matchEnd: data.matchEnd,
+            }),
+          };
+          if (buildAnchors) result.bm25Anchor = anchor;
+        }
+        result.passages = {
+          bm25: {
+            kind: 'bm25',
+            snippet: result.snippet,
+            ...(data && data.chunkText !== '' && { chunkText: data.chunkText }),
+            // Positions are kept even without --anchors: passage selection compares them.
+            ...(anchor && { anchor }),
+            // Markers appear in the content column only when the body itself matched.
+            bodyMatch: markedSnippet.includes(SNIPPET_MARK_START),
+          },
+        };
       }
     }
     return results;
@@ -407,6 +471,34 @@ function buildTrigramOrQuery(text: string): string {
     trigrams.push(`"${text.slice(i, i + 3).replace(/"/g, '')}"`);
   }
   return trigrams.join(' OR ');
+}
+
+/**
+ * Normalized BM25 score below which a hit only matched terms present in most notes:
+ * FTS5 floors such a term's IDF at 1e-6, so its score is around 1e-6 while any
+ * discriminative term scores orders of magnitude higher.
+ */
+const MIN_BM25_EVIDENCE = 1e-4;
+
+/** Share of trigrams one side must share with the other to count as title evidence. */
+const MIN_TITLE_TRIGRAM_SHARE = 0.34;
+
+/**
+ * True when a partial title match is real evidence: enough of the query's trigrams
+ * appear in the title or alias (a typo or partial word), or enough of the title's
+ * trigrams appear in the query (the title is named inside a longer query).
+ */
+export function hasTitleEvidence(
+  query: string,
+  result: Pick<RawResult, 'title' | 'aliases'>,
+): boolean {
+  const names = [result.title ?? '', ...parseAliases(result.aliases).filter((a) => a.length >= 3)];
+  return names.some(
+    (name) =>
+      name.length > 0 &&
+      (calculateTrigramOverlap(query, name) >= MIN_TITLE_TRIGRAM_SHARE ||
+        calculateTrigramOverlap(name, query) >= MIN_TITLE_TRIGRAM_SHARE),
+  );
 }
 
 function getTrigrams(text: string): Set<string> {
@@ -557,7 +649,12 @@ async function embedQuery(text: string): Promise<Float32Array | null> {
   return measureSearchStage('embedQuery', async () => {
     try {
       const [emb] = await embed([text], 'query');
-      if (emb) return emb;
+      if (emb) {
+        // Passage refinement compares blocks with the same query vector after
+        // retrieval; retrieval itself never reads this memo.
+        if (text.length <= 2000) queryEmbeddingMemo.set(embeddingMemoKey(text), emb);
+        return emb;
+      }
       // null = embedding failed (already retried internally)
       return null;
     } catch {
@@ -645,16 +742,123 @@ type Bm25ChunkData = {
   chunkText: string;
   charStart: number | null;
   charEnd: number | null;
+  /** Body-relative offsets of the located FTS hit. */
+  matchStart?: number;
+  matchEnd?: number;
 };
 
-function getChunkDataForBm25Results(results: RawResult[]): Map<string, Bm25ChunkData> {
+/**
+ * Body-relative position of the FTS hit in a marked snippet() window. snippet() copies
+ * a contiguous run of the indexed content (external content table = notes.content), so
+ * the window text, minus the "..." ellipses and markers, occurs verbatim in the body.
+ * Returns null when there is no marked hit or the window is not found exactly once.
+ */
+export function locateMarkedMatch(
+  content: string,
+  markedSnippet: string,
+  markStart = SNIPPET_MARK_START,
+  markEnd = SNIPPET_MARK_END,
+): { start: number; end: number } | null {
+  let window = markedSnippet;
+  if (window.startsWith('...')) window = window.slice(3);
+  if (window.endsWith('...')) window = window.slice(0, -3);
+  const open = window.indexOf(markStart);
+  if (open === -1) return null;
+  const close = window.indexOf(markEnd, open);
+  if (close === -1) return null;
+  const before = stripSnippetMarkers(window.slice(0, open), markStart, markEnd);
+  const term = stripSnippetMarkers(window.slice(open, close), markStart, markEnd);
+  const plain = stripSnippetMarkers(window, markStart, markEnd);
+  if (!plain.trim() || !term) return null;
+  const pos = content.indexOf(plain);
+  if (pos === -1 || content.indexOf(plain, pos + 1) !== -1) return null;
+  const start = pos + before.length;
+  return { start, end: start + term.length };
+}
+
+/**
+ * The stripped snippet() window, shortened from the front when the marked hit would
+ * otherwise fall outside `budget` characters. Returns null when there is no marked hit
+ * (the window is used as is).
+ */
+export function focusSnippetOnHit(
+  markedSnippet: string,
+  budget: number,
+  markStart = SNIPPET_MARK_START,
+  markEnd = SNIPPET_MARK_END,
+): string | null {
+  const open = markedSnippet.indexOf(markStart);
+  if (open === -1 || budget <= 0) return null;
+  const close = markedSnippet.indexOf(markEnd, open);
+  const plain = stripSnippetMarkers(markedSnippet, markStart, markEnd);
+  const hitStart = stripSnippetMarkers(markedSnippet.slice(0, open), markStart, markEnd).length;
+  const hitLength =
+    close === -1
+      ? 0
+      : stripSnippetMarkers(markedSnippet.slice(open, close), markStart, markEnd).length;
+  if (hitStart + hitLength <= Math.floor(budget * 0.8)) return plain;
+  // Start a little before the hit, preferably at the start of its line.
+  let start = Math.max(0, hitStart - Math.floor(budget * 0.3));
+  const lineStart = plain.lastIndexOf('\n', hitStart - 1) + 1;
+  if (lineStart > start) start = lineStart;
+  else {
+    const space = plain.indexOf(' ', start);
+    if (space !== -1 && space < hitStart) start = space + 1;
+  }
+  return `...${plain.slice(start)}`;
+}
+
+/** Heading chain (raw heading lines joined with " > ") in effect at `offset`. */
+function headingPathAtOffset(content: string, offset: number): string | null {
+  const headingSlots: (string | null)[] = [null, null, null, null, null, null];
+  let insideFence = false;
+  for (const line of content.slice(0, offset).split('\n')) {
+    if (/^(`{3,}|~{3,})/.test(line)) {
+      insideFence = !insideFence;
+      continue;
+    }
+    if (insideFence) continue;
+    const heading = parseMarkdownHeadingLine(line);
+    if (!heading) continue;
+    headingSlots[heading.level - 1] = `${heading.marker} ${heading.text}`;
+    for (let i = heading.level; i < 6; i++) headingSlots[i] = null;
+  }
+  const chain = headingSlots.filter((heading): heading is string => heading !== null);
+  return chain.length > 0 ? chain.join(' > ') : null;
+}
+
+type ChunkRow = {
+  path: string;
+  heading_path: string | null;
+  text: string;
+  chunk_index: number;
+  char_start: number | null;
+  char_end: number | null;
+};
+
+/** The chunk whose bounds contain the hit; with overlapping chunks, the one starting last. */
+function chunkContaining(rows: ChunkRow[], start: number, end: number): ChunkRow | undefined {
+  let best: ChunkRow | undefined;
+  for (const row of rows) {
+    if (row.char_start === null || row.char_end === null) continue;
+    if (row.char_start > start || row.char_end < end) continue;
+    if (!best || row.char_start > best.char_start!) best = row;
+  }
+  return best;
+}
+
+function getChunkDataForBm25Results(
+  results: RawResult[],
+  markedSnippets: Map<string, string> = new Map(),
+): Map<string, Bm25ChunkData> {
   if (results.length === 0) return new Map();
 
   const db = getDb();
-  const snippetKeys = getSnippetKeysForHeadingLookup(results);
-  if (snippetKeys.size === 0) return new Map();
+  const located = locateBm25Matches(db, results, markedSnippets);
+  const snippetKeys = getSnippetKeysForHeadingLookup(results.filter((r) => !located.has(r.path)));
+  if (located.size === 0 && snippetKeys.size === 0) return new Map();
 
-  const uniquePaths = Array.from(new Set(snippetKeys.keys()));
+  const uniquePaths = Array.from(new Set([...located.keys(), ...snippetKeys.keys()]));
   const placeholders = uniquePaths.map(() => '?').join(', ');
 
   try {
@@ -666,16 +870,38 @@ function getChunkDataForBm25Results(results: RawResult[]): Map<string, Bm25Chunk
          WHERE n.path IN (${placeholders})
          ORDER BY n.path, c.chunk_index`,
       )
-      .all(...uniquePaths) as Array<{
-      path: string;
-      heading_path: string | null;
-      text: string;
-      chunk_index: number;
-      char_start: number | null;
-      char_end: number | null;
-    }>;
+      .all(...uniquePaths) as ChunkRow[];
 
     const chunkData = matchChunkDataFromRows(rows, snippetKeys);
+    for (const [notePath, hit] of located) {
+      const noteRows = rows.filter((row) => row.path === notePath);
+      const chunk = chunkContaining(noteRows, hit.start, hit.end);
+      chunkData.set(
+        notePath,
+        chunk
+          ? {
+              // The heading chain at the hit itself: a chunk that merged several small
+              // sections carries no (or only its first) heading path.
+              headingPath:
+                headingPathAtOffset(hit.content, hit.start) ?? chunk.heading_path ?? null,
+              chunkText: chunk.text,
+              charStart: chunk.char_start,
+              charEnd: chunk.char_end,
+              matchStart: hit.start,
+              matchEnd: hit.end,
+            }
+          : {
+              // Chunks without offsets (older index): the hit position still gives the
+              // heading chain and an exact location.
+              headingPath: headingPathAtOffset(hit.content, hit.start),
+              chunkText: hit.lineText,
+              charStart: null,
+              charEnd: null,
+              matchStart: hit.start,
+              matchEnd: hit.end,
+            },
+      );
+    }
     fillMissingChunkData(db, chunkData, snippetKeys);
     return chunkData;
   } catch {
@@ -689,6 +915,42 @@ function getChunkDataForBm25Results(results: RawResult[]): Map<string, Bm25Chunk
     }
     return fallback;
   }
+}
+
+function locateBm25Matches(
+  db: ReturnType<typeof getDb>,
+  results: RawResult[],
+  markedSnippets: Map<string, string>,
+): Map<string, { start: number; end: number; content: string; lineText: string }> {
+  const located = new Map<
+    string,
+    { start: number; end: number; content: string; lineText: string }
+  >();
+  const paths = results
+    .map((r) => r.path)
+    .filter((p) => markedSnippets.get(p)?.includes(SNIPPET_MARK_START));
+  if (paths.length === 0) return located;
+  const placeholders = paths.map(() => '?').join(', ');
+  try {
+    const notes = db
+      .prepare(`SELECT path, content FROM notes WHERE path IN (${placeholders})`)
+      .all(...paths) as Array<{ path: string; content: string | null }>;
+    for (const note of notes) {
+      if (!note.content) continue;
+      const hit = locateMarkedMatch(note.content, markedSnippets.get(note.path) ?? '');
+      if (!hit) continue;
+      const lineStart = note.content.lastIndexOf('\n', hit.start - 1) + 1;
+      const lineEndRaw = note.content.indexOf('\n', hit.end);
+      const lineText = note.content.slice(
+        lineStart,
+        lineEndRaw === -1 ? note.content.length : lineEndRaw,
+      );
+      located.set(note.path, { ...hit, content: note.content, lineText });
+    }
+  } catch {
+    // Missing columns on very old databases: fall back to snippet-key matching.
+  }
+  return located;
 }
 
 function getSnippetKeysForHeadingLookup(results: RawResult[]): Map<string, string> {
@@ -900,24 +1162,34 @@ function searchVector(
         aliases: string | null;
       }>;
 
-      return rows.map((row) => {
+      return rows.map((row): RawResult => {
         // cosine similarity from L2 for unit vectors: cos = 1 - L2² / 2
         const similarity = Math.max(0, 1 - (row.distance * row.distance) / 2);
+        const snippet = formatChunkSnippet(row.heading_path, row.chunk_text, row.chunk_index > 0);
+        const semanticAnchor: MatchAnchor = {
+          kind: 'semantic' as const,
+          headingPath: row.heading_path ?? null,
+          matchText: buildMatchText(row.chunk_text),
+          charStart: row.char_start ?? null,
+          charEnd: row.char_end ?? null,
+        };
         return {
           path: row.path,
           title: row.title ?? '',
           tags: row.tags ?? '[]',
           aliases: row.aliases,
-          snippet: formatChunkSnippet(row.heading_path, row.chunk_text, row.chunk_index > 0),
+          snippet,
           chunkText: row.chunk_text,
           score: similarity,
           scores: { semantic: similarity },
-          semanticAnchor: {
-            kind: 'semantic' as const,
-            headingPath: row.heading_path ?? null,
-            matchText: buildMatchText(row.chunk_text),
-            charStart: row.char_start ?? null,
-            charEnd: row.char_end ?? null,
+          semanticAnchor,
+          passages: {
+            semantic: {
+              kind: 'semantic',
+              snippet,
+              chunkText: row.chunk_text,
+              anchor: semanticAnchor,
+            },
           },
         };
       });
@@ -956,10 +1228,19 @@ function rrfFusion(lists: RawResult[][], k = 60, weights?: number[]): RawResult[
         if (result.scores.fuzzy_title !== undefined) {
           existing.result.scores.fuzzy_title = result.scores.fuzzy_title;
         }
+        // Keep every branch's passage (the first list to bring one wins, i.e. the
+        // primary query in a multi-query fan-out); passage selection picks later.
+        if (result.passages) {
+          existing.result.passages = { ...result.passages, ...existing.result.passages };
+        }
       } else {
         scores.set(result.path, {
           rrfScore,
-          result: { ...result, scores: { ...result.scores } },
+          result: {
+            ...result,
+            scores: { ...result.scores },
+            ...(result.passages && { passages: { ...result.passages } }),
+          },
         });
       }
     });
@@ -1515,16 +1796,14 @@ export async function searchWithMeta(
       );
       related = related.filter((result) => allowedPaths.has(result.path));
     }
+    // The note's opening text only stands in for a missing link context; a short
+    // context around the link is the relevant part and is kept as is.
     const fallbackSnippets = getSnippetFallbacks(
-      related.filter((r) => !r.snippet || r.snippet.length < snippetLength).map((r) => r.path),
+      related.filter((r) => !r.snippet).map((r) => r.path),
       snippetLength,
     );
-    // Expand short snippets up to snippetLength, then cap
     for (const r of related) {
-      if (!r.snippet || r.snippet.length < snippetLength) {
-        const fallback = fallbackSnippets.get(r.path) ?? '';
-        if (fallback.length > r.snippet.length) r.snippet = fallback;
-      }
+      if (!r.snippet) r.snippet = fallbackSnippets.get(r.path) ?? '';
       if (r.snippet.length > snippetLength) r.snippet = r.snippet.slice(0, snippetLength);
     }
     related.forEach((r, i) => {
@@ -1698,6 +1977,7 @@ export async function searchWithMeta(
     for (const r of results) {
       r.scores.hybrid = r.score;
     }
+    applyPassageSelection(results, options.queries[0]!);
     // Rerank after full merge — only in hybrid mode
     if (options.rerank) {
       if (mode !== 'hybrid') {
@@ -1720,32 +2000,43 @@ export async function searchWithMeta(
     );
   }
 
+  // Scope, tag and frontmatter are pushed into every retrieval arm as a SQL
+  // predicate, so there is nothing left for them to trim here. applyThreshold
+  // STAYS: it is a score cutoff, cannot be expressed as a predicate over `notes`,
+  // and deleting it silently turns --threshold into a no-op. It must keep running
+  // BEFORE the final slice, or a below-threshold result would consume a slot.
+  let ranked = applyThreshold(results, threshold);
+  if (!noLimit) ranked = ranked.slice(0, limit);
+  // Stage two: the documents are final; only the passage each one shows is narrowed.
+  const passageQuery = options.queries && options.queries.length > 1 ? options.queries[0]! : input;
+  if (!isPathLookup && passageQuery.trim()) {
+    await measureSearchStage('passageRefine', () =>
+      refinePassages(ranked, passageQuery, mode, snippetLength),
+    );
+  }
+
   const { filteredResults, final } = measureSearchStageSync('filterAndFormat', () => {
-    // Scope, tag and frontmatter are pushed into every retrieval arm as a SQL
-    // predicate, so there is nothing left for them to trim here. applyThreshold
-    // STAYS: it is a score cutoff, cannot be expressed as a predicate over `notes`,
-    // and deleting it silently turns --threshold into a no-op. It must keep running
-    // BEFORE the final slice, or a below-threshold result would consume a slot.
-    let filteredResults = applyThreshold(results, threshold);
-    if (!noLimit) filteredResults = filteredResults.slice(0, limit);
+    const filteredResults = ranked;
 
     const paths = filteredResults.map((r) => r.path);
     const { links, backlinks } = getLinksForPaths(paths);
     const markdown = getMarkdownLinksForPaths(paths);
     const urls = getUrlsForPaths(paths);
+    // The start of the note is only a stand-in for results WITHOUT a retrieval passage
+    // (title-only matches). A short passage snippet is still the relevant one and is
+    // never replaced just because the note's opening text is longer.
     const fallbackSnippets = getSnippetFallbacks(
-      paths.filter((path, index) => {
-        const raw = filteredResults[index];
-        return raw ? !raw.snippet || raw.snippet.length < snippetLength : false;
-      }),
+      paths.filter((_path, index) => !filteredResults[index]?.snippet),
       snippetLength,
     );
 
     const final = filteredResults.map((r, i) => {
       const sr = toSearchResult(r);
-      if (!sr.snippet || sr.snippet.length < snippetLength) {
-        const fallback = fallbackSnippets.get(sr.path) ?? '';
-        if (fallback.length > sr.snippet.length) sr.snippet = fallback;
+      if (r.primaryPassage) {
+        sr.snippetSource = r.primaryPassage;
+      } else if (!sr.snippet) {
+        sr.snippet = fallbackSnippets.get(sr.path) ?? '';
+        if (sr.snippet) sr.snippetSource = 'intro';
       }
       if (sr.snippet.length > snippetLength) sr.snippet = sr.snippet.slice(0, snippetLength);
       return {
@@ -1767,17 +2058,18 @@ export async function searchWithMeta(
     for (let i = 0; i < final.length; i++) {
       const raw = filteredResults[i];
       if (!raw) continue;
+      // The primary passage's anchor comes first; the other branch's anchor stays as a
+      // secondary one unless it points at the same block.
+      const [first, second] =
+        raw.primaryPassage === 'bm25'
+          ? [raw.bm25Anchor, raw.semanticAnchor]
+          : [raw.semanticAnchor, raw.bm25Anchor];
       const anchors: MatchAnchor[] = [];
-      if (raw.semanticAnchor) anchors.push(raw.semanticAnchor);
-      if (raw.bm25Anchor) {
-        // Deduplicate: skip BM25 anchor if it points to the same block as semantic
-        if (!raw.semanticAnchor || raw.bm25Anchor.matchText !== raw.semanticAnchor.matchText) {
-          anchors.push(raw.bm25Anchor);
-        }
-      }
+      if (first) anchors.push(first);
+      if (second && (!first || second.matchText !== first.matchText)) anchors.push(second);
       if (anchors.length > 0) {
         final[i]!.previewAnchors = anchors;
-        final[i]!.primaryAnchorIndex = 0; // semantic (index 0) is always primary when present
+        final[i]!.primaryAnchorIndex = 0; // anchors[0] belongs to the displayed passage
       }
     }
   }
@@ -1788,6 +2080,270 @@ export async function searchWithMeta(
   };
   searchCache.set(key, response);
   return response;
+}
+
+/** Results whose passage is narrowed to a block; the rest keep their chunk passage. */
+const PASSAGE_REFINE_LIMIT = 20;
+/** Results whose blocks are compared by embedding; lower ones use lexical coverage. */
+const PASSAGE_EMBED_LIMIT = 8;
+/** Block embeddings computed per search at most (~5 ms each locally); cached ones are free. */
+const MAX_NEW_BLOCK_EMBEDDINGS = 24;
+/** Block embeddings do not depend on the query, so typing reuses them. */
+const blockEmbeddingCache = new LRUCache<Float32Array>(4096);
+const queryEmbeddingMemo = new LRUCache<Float32Array>(64);
+
+/** Cache key for an embedding: the embedding configuration, the index version and the text. */
+function embeddingMemoKey(text: string, withVersion = true): string {
+  const model = `${config.apiBaseUrl}|${config.apiModel}|${config.localModel}`;
+  return withVersion
+    ? `${model}\0v${getDbVersion()}_${localVersion}\0${text}`
+    : `${model}\0${text}`;
+}
+
+interface RefineJob {
+  result: RawResult;
+  kind: PassageKind;
+  content: string;
+  blocks: PassageBlock[];
+  candidates: number[];
+  hitOffset?: number;
+}
+
+function cosine(a: Float32Array, b: Float32Array): number | null {
+  // A different dimension means another model wrote it: no score, never a prefix one.
+  if (a.length !== b.length) return null;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i]! * b[i]!;
+    na += a[i]! * a[i]!;
+    nb += b[i]! * b[i]!;
+  }
+  return na > 0 && nb > 0 ? dot / Math.sqrt(na * nb) : 0;
+}
+
+/**
+ * Passage selection, stage two: inside the primary passage's chunk, pick the Markdown
+ * block that answers the query and make it the snippet, heading and anchor. Document
+ * order is never touched. A verified exact hit (BM25) picks its own block; otherwise
+ * semantic passages are compared with block embeddings from the same local model,
+ * computed only for the final top results and cached across searches. When no block
+ * embedding is available, lexical coverage decides.
+ */
+async function refinePassages(
+  results: RawResult[],
+  query: string,
+  mode: string,
+  snippetLength: number,
+): Promise<void> {
+  const targets = results.slice(0, PASSAGE_REFINE_LIMIT).filter((r) => {
+    const anchor = r.primaryPassage ? r.passages?.[r.primaryPassage]?.anchor : undefined;
+    return anchor && (anchor.charStart !== null || anchor.matchStart !== undefined);
+  });
+  if (targets.length === 0) return;
+  const contents = getNoteContents(targets.map((r) => r.path));
+
+  const jobs: RefineJob[] = [];
+  for (const result of targets) {
+    const kind = result.primaryPassage!;
+    const anchor = result.passages![kind]!.anchor!;
+    const content = contents.get(result.path);
+    if (!content) continue;
+    let from = anchor.charStart;
+    let to = anchor.charEnd;
+    if (from === null || to === null) {
+      // Older index without chunk offsets: the paragraph around the located hit.
+      const hit = anchor.matchStart!;
+      const before = content.lastIndexOf('\n\n', hit);
+      const after = content.indexOf('\n\n', anchor.matchEnd ?? hit);
+      from = before === -1 ? 0 : before + 2;
+      to = after === -1 ? content.length : after;
+    }
+    if (to > content.length) continue; // stale offsets: keep the chunk passage
+    const blocks = splitMarkdownBlocks(content, from, to);
+    if (blocks.length === 0) continue;
+    // The FTS hit decides alone for a one-term query or when its block holds the whole
+    // query; for a longer full-text query it is just the first matched word, so the
+    // block with the best term coverage is chosen instead.
+    const hitBlock =
+      kind === 'bm25' && anchor.matchStart !== undefined
+        ? blocks.find((b) => anchor.matchStart! >= b.start && anchor.matchStart! < b.end)
+        : undefined;
+    const hitOffset =
+      hitBlock &&
+      (queryTerms(query).length <= 1 ||
+        findExactOccurrence(content, hitBlock.start, hitBlock.end, query) !== null)
+        ? anchor.matchStart
+        : undefined;
+    jobs.push({
+      result,
+      kind,
+      content,
+      blocks,
+      candidates: candidateBlocks(blocks, query),
+      hitOffset,
+    });
+  }
+
+  const scores = await semanticBlockScores(
+    jobs
+      .filter((job) => job.kind === 'semantic' && job.candidates.length > 1)
+      .slice(0, PASSAGE_EMBED_LIMIT),
+    query,
+  );
+  for (const job of jobs) {
+    const index = chooseBlock({
+      blocks: job.blocks,
+      query,
+      hitOffset: job.hitOffset,
+      semanticScores: scores.get(job),
+    });
+    if (index === -1) continue;
+    applyRefinedPassage(job, passageRange(job.blocks, index), query, mode, snippetLength);
+  }
+}
+
+async function semanticBlockScores(
+  jobs: RefineJob[],
+  query: string,
+): Promise<Map<RefineJob, Array<number | null>>> {
+  const scores = new Map<RefineJob, Array<number | null>>();
+  if (jobs.length === 0) return scores;
+  const texts = new Map<string, Float32Array | null>();
+  for (const job of jobs) {
+    for (const i of job.candidates) {
+      const text = blockEmbeddingText(job.blocks[i]!.text);
+      if (text && !texts.has(text))
+        texts.set(text, blockEmbeddingCache.get(embeddingMemoKey(text, false)) ?? null);
+    }
+  }
+  const missing = [...texts.entries()]
+    .filter(([, vector]) => vector === null)
+    .map(([text]) => text)
+    .slice(0, MAX_NEW_BLOCK_EMBEDDINGS)
+    // A local batch is padded to its longest text: similar lengths together are faster.
+    .sort((a, b) => a.length - b.length);
+  const [queryVector, vectors] = await Promise.all([
+    queryEmbeddingMemo.get(embeddingMemoKey(query)) ?? embedQuery(query),
+    missing.length > 0 ? embed(missing, 'document').catch(() => []) : Promise.resolve([]),
+  ]);
+  if (!queryVector) return scores;
+  missing.forEach((text, i) => {
+    const vector = vectors[i];
+    if (!vector) return;
+    texts.set(text, vector);
+    blockEmbeddingCache.set(embeddingMemoKey(text, false), vector);
+  });
+  for (const job of jobs) {
+    const row: Array<number | null> = job.blocks.map(() => null);
+    for (const i of job.candidates) {
+      const vector = texts.get(blockEmbeddingText(job.blocks[i]!.text));
+      if (vector) row[i] = cosine(queryVector, vector);
+    }
+    // Blocks over the budget have no score; then lexical coverage decides for all.
+    if (job.candidates.every((i) => row[i] !== null)) scores.set(job, row);
+  }
+  return scores;
+}
+
+/** Display text that keeps a far-in exact hit visible: cut at a line or sentence start. */
+function passageDisplayText(
+  content: string,
+  range: { start: number; end: number },
+  hit: { start: number; end: number } | null,
+): string {
+  const text = content.slice(range.start, range.end);
+  if (!hit || hit.start - range.start <= 160) return text;
+  const offset = hit.start - range.start;
+  const floor = Math.max(0, offset - 120);
+  const window = text.slice(floor, offset);
+  const cut = Math.max(
+    window.lastIndexOf('\n'),
+    window.lastIndexOf('. '),
+    window.lastIndexOf('; '),
+  );
+  const start = cut === -1 ? floor + Math.max(0, window.indexOf(' ') + 1) : floor + cut + 1;
+  return `...${text.slice(start).trimStart()}`;
+}
+
+function applyRefinedPassage(
+  job: RefineJob,
+  range: { start: number; end: number },
+  query: string,
+  mode: string,
+  snippetLength: number,
+): void {
+  const { result, kind, content } = job;
+  const passage = result.passages![kind]!;
+  const anchor = passage.anchor!;
+  const text = content.slice(range.start, range.end);
+  // The exact evidence to highlight: the FTS hit, or the whole identifier/phrase
+  // inside a semantic passage — never in semantic mode, which shows meaning only.
+  let hit: { start: number; end: number } | null = null;
+  const ftsHitInside =
+    kind === 'bm25' &&
+    anchor.matchStart !== undefined &&
+    anchor.matchEnd !== undefined &&
+    anchor.matchStart >= range.start &&
+    anchor.matchEnd <= range.end;
+  if (ftsHitInside) {
+    hit = { start: anchor.matchStart!, end: anchor.matchEnd! };
+  } else if (mode !== 'semantic' && isLiteralQuery(query)) {
+    hit = findExactOccurrence(content, range.start, range.end, query);
+  }
+  if (!hit && kind === 'bm25') hit = findTermOccurrence(content, range.start, range.end, query);
+  const headingPath = headingPathAtOffset(content, range.start) ?? anchor.headingPath;
+  const refined = {
+    ...anchor,
+    headingPath,
+    // matchText must lie in the passage: the FTS hit line while the hit is inside it,
+    // otherwise the passage's first line.
+    matchText: ftsHitInside ? anchor.matchText : buildMatchText(text),
+    charStart: anchor.charStart === null ? null : Math.min(anchor.charStart, range.start),
+    charEnd: anchor.charEnd === null ? null : Math.max(anchor.charEnd, range.end),
+    matchStart: hit?.start,
+    matchEnd: hit?.end,
+    passageStart: range.start,
+    passageEnd: range.end,
+  };
+  passage.anchor = refined;
+  if (kind === 'semantic' && result.semanticAnchor) result.semanticAnchor = refined;
+  if (kind === 'bm25' && result.bm25Anchor) result.bm25Anchor = refined;
+  if (snippetLength > 0) {
+    const display = passageDisplayText(content, range, hit);
+    passage.snippet = headingPath ? `${headingPath}\n${display}` : display;
+    result.snippet = passage.snippet;
+  }
+}
+
+function getNoteContents(paths: string[]): Map<string, string> {
+  const contents = new Map<string, string>();
+  if (paths.length === 0) return contents;
+  try {
+    const rows = getDb()
+      .prepare(`SELECT path, content FROM notes WHERE path IN (${paths.map(() => '?').join(', ')})`)
+      .all(...paths) as Array<{ path: string; content: string | null }>;
+    for (const row of rows) if (row.content) contents.set(row.path, row.content);
+  } catch {
+    // Very old databases without stored content keep the chunk-level passage.
+  }
+  return contents;
+}
+
+/**
+ * Make the passage chosen by choosePrimaryPassage drive the result: its snippet is
+ * displayed and its chunk is what the reranker scores. Document order is untouched.
+ */
+function applyPassageSelection(results: RawResult[], query: string): void {
+  for (const result of results) {
+    const kind = choosePrimaryPassage(result.passages, query);
+    result.primaryPassage = kind;
+    if (!kind) continue;
+    const passage: Passage = result.passages![kind]!;
+    result.snippet = passage.snippet;
+    if (passage.chunkText) result.chunkText = passage.chunkText;
+  }
 }
 
 /**
@@ -1899,9 +2455,11 @@ async function searchByQuery(
   }
 
   if (mode === 'fulltext') {
-    return measureSearchStageSync('bm25', () =>
+    const bm25 = measureSearchStageSync('bm25', () =>
       searchBm25(query, limit, snippetLength, buildAnchors, predicate),
     );
+    applyPassageSelection(bm25, query);
+    return bm25;
   }
 
   if (mode === 'title') {
@@ -1921,7 +2479,9 @@ async function searchByQuery(
     // If embedding permanently failed after retries, return empty rather than
     // polluting results with uniform zero-vector scores.
     if (!f32) return [];
-    return searchVector(f32, limit, predicate);
+    const semantic = searchVector(f32, limit, predicate);
+    applyPassageSelection(semantic, query);
+    return semantic;
   }
 
   // hybrid: RRF fusion of all three
@@ -1951,10 +2511,18 @@ async function searchByQuery(
   // Exact alias matches (fuzzy_title=1.0) are canonical identity signals — treated like BM25.
   // Partial fuzzy matches (trigram overlap < 1.0) remain at low weight to avoid false positives.
   const exactAliasResults = fuzzyResults.filter((r) => r.scores.fuzzy_title === 1.0);
-  const partialFuzzyResults = fuzzyResults.filter((r) => r.scores.fuzzy_title !== 1.0);
+  // RRF credits a list position, not a score, so weak evidence still moves documents.
+  // Two kinds carry no real evidence and are kept out of the fusion: a title that
+  // shares only a stray trigram with the query ("Stream" for "MergeTree"), and a BM25
+  // hit that matched only words found in most notes (FTS5 floors their IDF, so the
+  // score is ~0 — e.g. "как" in a question).
+  const partialFuzzyResults = fuzzyResults.filter(
+    (r) => r.scores.fuzzy_title !== 1.0 && hasTitleEvidence(query, r),
+  );
+  const bm25Evidence = bm25Results.filter((r) => (r.scores.bm25 ?? 0) >= MIN_BM25_EVIDENCE);
   let results = measureSearchStageSync('rrfFusion', () =>
     rrfFusion(
-      [vectorResults, bm25Results, exactAliasResults, partialFuzzyResults],
+      [vectorResults, bm25Evidence, exactAliasResults, partialFuzzyResults],
       60,
       [1.5, 1.5, 2.0, 0.25],
     ),
@@ -1964,6 +2532,9 @@ async function searchByQuery(
   for (const r of results) {
     r.scores.hybrid = r.score;
   }
+  // Passage selection never reorders documents; it runs before reranking so the
+  // reranker scores the same passage the result will display.
+  applyPassageSelection(results, query);
 
   if (rerank) {
     results = await measureSearchStage('rerank', () => applyRerank(results, query, candidateLimit));

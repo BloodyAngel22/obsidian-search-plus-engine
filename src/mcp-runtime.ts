@@ -572,7 +572,9 @@ export function createMcpServer(runtime: McpRuntime): Server {
               type: 'boolean',
               description:
                 'When true, includes previewAnchors in each result for precise UI navigation. ' +
-                'Each anchor has headingPath, matchText, charStart, charEnd. ' +
+                'Each anchor has headingPath, matchText, charStart, charEnd (chunk bounds in the note body after frontmatter); ' +
+                'passageStart/passageEnd bound the displayed passage (one Markdown block); matchStart/matchEnd mark a verified exact hit. ' +
+                'previewAnchors[primaryAnchorIndex] is the displayed passage. ' +
                 'Not needed for most MCP use cases — the snippet field is sufficient. ' +
                 'Use when building a UI that renders the note and needs to scroll to the matched region. ' +
                 'Default: false.',

@@ -107,7 +107,7 @@ All note paths stored in the database are NFD-normalized with `path.normalize('N
 
 ### Hybrid Search (RRF)
 
-Hybrid search runs semantic, BM25, exact alias, and partial fuzzy result lists through weighted RRF with `k=60`. Semantic and BM25 lists use weight 1.5, exact aliases use 2.0, and partial fuzzy matches use 0.25. `search()` caches up to 100 result sets and invalidates them with database and in-process versions.
+Hybrid search runs semantic, BM25, exact alias, and partial fuzzy result lists through weighted RRF with `k=60`. Semantic and BM25 lists use weight 1.5, exact aliases use 2.0, and partial fuzzy matches use 0.25. RRF credits list positions, so two kinds of non-evidence stay out of the fusion: partial title matches sharing under a third of the trigrams either way (`hasTitleEvidence`), and BM25 hits scoring below `MIN_BM25_EVIDENCE` (only terms present in most notes matched). `search()` caches up to 100 result sets and invalidates them with database and in-process versions.
 
 ### Related Mode (BFS)
 
@@ -122,7 +122,9 @@ A leading `-` excludes a value. Tag and frontmatter includes use AND semantics. 
 1. BM25 uses SQLite `snippet()` and adds the matching heading path when available.
 2. Semantic search returns the matching chunk with its heading path.
 3. Related mode extracts context around the link that produced the result.
-4. Short or empty snippets fall back to note content and are capped by `snippetLength`.
+4. Only empty snippets (results without a retrieval passage, e.g. title-only matches) fall back to note content (`snippetSource: 'intro'`); a short passage snippet is never replaced. All snippets are capped by `snippetLength`.
+5. In ranked searches `passage-selection.ts` picks ONE primary passage per note (BM25 or semantic). Its snippet is displayed, its anchor is `previewAnchors[0]`, and its chunk is the reranker input. It never reorders documents.
+6. After ranking, `refinePassages` (searcher.ts) narrows that passage to one Markdown block of its chunk (`passage-blocks.ts`): the FTS hit's block, else the block holding a literal identifier/phrase, else the block whose embedding is closest to the query (same model, top 8 results, at most 24 new block embeddings per search, cached), else lexical coverage. The snippet, `headingPath`, `matchText` and `passageStart`/`passageEnd` all come from that block. No reindex is needed: blocks are cut from `notes.content` with the stored chunk offsets.
 
 ### DB Is a Singleton
 
