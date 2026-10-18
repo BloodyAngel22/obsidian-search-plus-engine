@@ -983,7 +983,7 @@ describe('aliases', () => {
         'SELECT alias, alias_norm FROM note_aliases WHERE note_id = (SELECT id FROM notes WHERE path = ?)',
       )
       .all('alias-lookup.md') as Array<{ alias: string; alias_norm: string }>;
-    rows = rows.sort((a, b) => a.alias.localeCompare(b.alias));
+    rows = rows.sort((a, b) => a.alias.localeCompare(b.alias, 'en'));
 
     assert.deepEqual(rows, [
       { alias: 'Alt Name', alias_norm: 'alt name' },
